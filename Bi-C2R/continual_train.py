@@ -14,7 +14,7 @@ from reid.utils.serialization import load_checkpoint, save_checkpoint, copy_stat
 from reid.utils.lr_scheduler import WarmupMultiStepLR
 from reid.utils.feature_tools import *
 from reid.models.layers import DataParallel
-from reid.models.resnet import make_model, TransNet_adaptive, LTSKAdapterLite
+from reid.models.resnet import make_model, TransNet_adaptive
 from reid.trainer import Trainer
 from torch.utils.tensorboard import SummaryWriter
 
@@ -82,12 +82,8 @@ def main_worker(args, cfg):
     
     first_train_set = all_train_sets[0]
     model = make_model(args, num_class=first_train_set[1], camera_num=0, view_num=0)
-    if args.use_ltsk_adapter:
-        model_trans = LTSKAdapterLite(hidden_planes=args.adapter_hidden, num_prototype=args.adapter_prototypes)
-        model_trans2 = LTSKAdapterLite(hidden_planes=args.adapter_hidden, num_prototype=args.adapter_prototypes)
-    else:
-        model_trans = TransNet_adaptive()
-        model_trans2 = TransNet_adaptive()
+    model_trans=TransNet_adaptive()
+    model_trans2=TransNet_adaptive()
 
     model.cuda()
     model_trans.cuda()
@@ -141,7 +137,7 @@ def main_worker(args, cfg):
         
         if set_index>0:
             best_alpha = get_adaptive_alpha(args, model, model_old, all_train_sets, set_index)
-            model = dynamic_combination(args, model, model_old, best_alpha)
+            model = linear_combination(args, model, model_old, best_alpha)
 
         dataset, num_classes, train_loader, test_loader, init_loader, name = all_train_sets[set_index]
         from reid.evaluators import extract_features
@@ -164,19 +160,12 @@ def main_worker(args, cfg):
                     
                     for start_pos in range(0, feature_tensor.shape[0], args.batch_size):
                         end_pos = min(start_pos + args.batch_size, feature_tensor.shape[0])
-                        batch_features = feature_tensor[start_pos:end_pos].cuda()
+                        batch_features = feature_tensor[start_pos:end_pos]
                         batch_features_trans = model_trans(batch_features)
                         batch_features_trans = F.normalize(batch_features_trans, p=2, dim=1)
-                        if hasattr(model_trans.module, 'prototype'):
-                            proto_bank = F.normalize(model_trans.module.prototype.detach(), p=2, dim=1)
-                            if proto_bank.numel() > 0:
-                                sim = torch.matmul(batch_features, proto_bank.t())
-                                proto_weight = F.softmax(sim, dim=1)
-                                proto_corr = torch.matmul(proto_weight, proto_bank)
-                                batch_features_trans = 0.5 * batch_features_trans + 0.5 * proto_corr
-                        batch_features_trans = best_alpha * batch_features_trans + (1 - best_alpha) * batch_features
+                        batch_features_trans = best_alpha * batch_features_trans + (1 - best_alpha) * batch_features.cuda()
                         for i in range(start_pos, end_pos):
-                            updated_features_dict[feature_keys[i]] = batch_features_trans[i - start_pos].detach().cpu()
+                            updated_features_dict[feature_keys[i]] = batch_features_trans[i - start_pos]
                     each_old_gallery['features'] = updated_features_dict
                     torch.save(each_old_gallery, args.logs_dir + str(each_data) + '_features.pth.tar')
                     print("Old Gallery Feature Updated to: ", args.logs_dir + str(each_data) + '_features.pth.tar')
@@ -377,50 +366,12 @@ def linear_combination(args, model, model_old, alpha, model_old_id=-1):
     model_new_state_dict = model_new.state_dict()
     '''fuse the parameters'''
     for k, v in model_state_dict.items():
-        if k not in model_old_state_dict:
-            model_new_state_dict[k] = v
-            continue
         if model_old_state_dict[k].shape == v.shape:
                 model_new_state_dict[k] = alpha * v + (1 - alpha) * model_old_state_dict[k]
         else:
             print(k, '...')
-            num_class_old = min(model_old_state_dict[k].shape[0], v.shape[0])
-            model_new_state_dict[k][:num_class_old] = alpha * v[:num_class_old] + (1 - alpha) * model_old_state_dict[k][:num_class_old]
-    model_new.load_state_dict(model_new_state_dict)
-    return model_new
-
-
-def dynamic_combination(args, model, model_old, alpha, old_loader=None):
-    """Lightweight adaptive fusion for history updates.
-
-    It keeps the old global alpha path as fallback, but allows a safer
-    sample-level correction using the current adapter's prototype if present.
-    The function is intentionally memory-light and runs on feature tensors only.
-    """
-    if old_loader is None:
-        return linear_combination(args, model, model_old, alpha)
-
-    if not hasattr(model, 'module'):
-        return linear_combination(args, model, model_old, alpha)
-
-    adapter = getattr(model.module, 'model_trans', None)
-    if adapter is None and hasattr(model.module, 'trans_forward'):
-        adapter = model.module.trans_forward
-
-    model_new = copy.deepcopy(model)
-    model_new_state_dict = model_new.state_dict()
-    old_state_dict = model_old.state_dict()
-    cur_state_dict = model.state_dict()
-
-    for k, v in cur_state_dict.items():
-        if k not in old_state_dict:
-            model_new_state_dict[k] = v
-            continue
-        if old_state_dict[k].shape == v.shape:
-            model_new_state_dict[k] = alpha * v + (1 - alpha) * old_state_dict[k]
-        else:
-            keep = min(old_state_dict[k].shape[0], v.shape[0])
-            model_new_state_dict[k][:keep] = alpha * v[:keep] + (1 - alpha) * old_state_dict[k][:keep]
+            num_class_old = model_old_state_dict[k].shape[0]
+            model_new_state_dict[k][:num_class_old] = alpha * v[:num_class_old] + (1 - alpha) * model_old_state_dict[k]
     model_new.load_state_dict(model_new_state_dict)
     return model_new
 
@@ -495,9 +446,5 @@ if __name__ == '__main__':
     parser.add_argument('--weight_anti', type=float, default=1, help='weight for anti_forget loss')
     parser.add_argument('--weight_discri', type=float, default=0.007, help='weight for anti_discrimination loss')
     parser.add_argument('--weight_transx', type=float, default=0.0005, help='weight for transformation_x loss')
-    parser.add_argument('--weight_ltsk', type=float, default=0.01, help='weight for lightweight LTSKC++-style prototype guidance')
-    parser.add_argument('--adapter_hidden', type=int, default=256, help='hidden width for lightweight adapter')
-    parser.add_argument('--adapter_prototypes', type=int, default=8, help='prototype count for lightweight adapter')
-    parser.add_argument('--use_ltsk_adapter', action='store_true', help='use lightweight adapter instead of the default transnet')
     
     main()
