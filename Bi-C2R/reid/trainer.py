@@ -35,8 +35,9 @@ class Trainer(object):
         self.weight_anti = args.weight_anti
         self.weight_discri = args.weight_discri
         self.weight_transx = args.weight_transx
+        self.weight_ltsk = getattr(args, 'weight_ltsk', 0.01)
 
-    def loss_cr(self, targets_, s_features_old_, trans_old_features_norm_):
+    def loss_cr(self, targets_, s_features_old_, trans_old_features_norm_, proto_bank=None):
 
         local_pids_temp_ = targets_
         local_pids_temp_ = local_pids_temp_.expand(len(targets_), len(targets_))
@@ -58,7 +59,22 @@ class Trainer(object):
         new_sim_prob_unpair_ = torch.where(pid_mask_, new_sim_prob_, new_sim_prob_unpair_)
 
         new_sim_prob_unpair_log_ = torch.log(new_sim_prob_unpair_)
-        return self.weight_anti * self.criterion_anti_forget(new_sim_prob_unpair_log_, old_sim_prob_unpair_)
+        anti_loss = self.weight_anti * self.criterion_anti_forget(new_sim_prob_unpair_log_, old_sim_prob_unpair_)
+
+        if proto_bank is None:
+            return anti_loss
+
+        targets_cpu = targets_.detach().long().cpu()
+        proto_bank = F.normalize(proto_bank, p=2, dim=1)
+        if proto_bank.size(0) == 0:
+            return anti_loss
+
+        target_idx = targets_cpu % proto_bank.size(0)
+        proto_targets = proto_bank[target_idx.to(proto_bank.device)]
+        proto_targets = proto_targets.to(trans_old_features_norm_.device)
+        proto_targets = proto_targets.detach()
+        proto_loss = 1.0 - F.cosine_similarity(trans_old_features_norm_, proto_targets, dim=1).mean()
+        return anti_loss + self.weight_ltsk * proto_loss
 
     def train(self, epoch, data_loader_train,  optimizer, training_phase,
               train_iters=200, add_num=0, old_model=None,         
@@ -118,9 +134,14 @@ class Trainer(object):
                 
                 trans_loss = self.weight_trans * self.criterion_transform(trans_old_features_norm, s_features)\
                            + self.weight_trans * self.criterion_transform(trans_new_features_norm, s_features_old)
+                ltsk_cycle_loss = self.weight_ltsk * (1 - self.criterion_transform_x(F.normalize(trans_old_features_norm, p=2, dim=1), F.normalize(trans_new_features_norm.detach(), p=2, dim=1)).mean())
+                trans_loss = trans_loss + ltsk_cycle_loss
                 losses_ca.update(trans_loss.item())
                 
-                anti_loss = self.loss_cr(targets, s_features_old, trans_old_features_norm) + self.loss_cr(targets, s_features, trans_new_features_norm)
+                proto_bank = None
+                if hasattr(self.model_trans.module, 'prototype'):
+                    proto_bank = self.model_trans.module.prototype.detach()
+                anti_loss = self.loss_cr(targets, s_features_old, trans_old_features_norm, proto_bank=proto_bank) + self.loss_cr(targets, s_features, trans_new_features_norm, proto_bank=proto_bank)
                 
                 losses_cr.update(anti_loss.item())
                 
